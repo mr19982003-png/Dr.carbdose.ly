@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: carb-monitor-tarek
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: WA_INSTANCE_ID
+        sync: false
+      - key: WA_API_TOKEN
+        sync: false
+      - key: WA_RECIPIENT
+        value: 218926553884@c.us
+      - key: HIGH_THRESHOLD
+        value: "250"
+      - key: HIGH_COUNT
+        value: "3"
+      - key: LOW_THRESHOLD
+        value: "70"
+      - key: LOW_COUNT
+        value: "2"
+      - key: NO_READING_HOUR
+        value: "20"
+      - key: CHECK_INTERVAL
+        value: "60"
