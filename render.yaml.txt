@@ -5,9 +5,9 @@ services:
     buildCommand: npm install
     startCommand: npm start
     envVars:
-      - key: WA_INSTANCE_ID
+      - key: WA_INSTANCE_ID710722721793
         sync: false
-      - key: WA_API_TOKEN
+      - key: WA_API_TOKENdcc131accd21464f8a5cc066b2e4065b09475b9468b0456ea0
         sync: false
       - key: WA_RECIPIENT
         value: 218926553884@c.us
