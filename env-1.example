@@ -1,0 +1,23 @@
+# ══════════════════════════════════════════
+# متغيرات البيئة — وكيل المراقبة
+# ══════════════════════════════════════════
+
+# ─── Green API (WhatsApp) ───────────────
+# سجّل مجاناً على: https://green-api.com
+WA_INSTANCE_ID=1101234567
+WA_API_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# رقمك الذي ستصله التنبيهات (بدون + أو 00)
+WA_RECIPIENT=218926553884@c.us
+
+# ─── حدود التنبيه ───────────────────────
+HIGH_THRESHOLD=250
+HIGH_COUNT=3
+LOW_THRESHOLD=70
+LOW_COUNT=2
+
+# ساعة إرسال "لم يسجّل" (24h)
+NO_READING_HOUR=20
+
+# دقائق بين كل فحص
+CHECK_INTERVAL=60

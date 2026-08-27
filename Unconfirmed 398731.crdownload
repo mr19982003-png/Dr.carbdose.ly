@@ -1,0 +1,286 @@
+/**
+ * ══════════════════════════════════════════════════════════
+ *  وكيل مراقبة الحالات — نظام إشعارات واتساب
+ *  كارب كالكيولاتور — إعداد أ. محمد طارق
+ *  يستخدم: Green API (whatsapp) — مجاني ✅
+ * ══════════════════════════════════════════════════════════
+ *
+ *  شروط التنبيه:
+ *  🚨 ارتفاع متكرر  — قراءة > 250  ثلاث مرات أو أكثر في اليوم
+ *  ⬇️  هبوط متكرر   — قراءة < 70   أكثر من مرة في اليوم
+ *  ⚠️  لم يسجّل     — لا قراءات طوال اليوم (تنبيه بعد 8 مساءً)
+ */
+
+require('dotenv').config();
+const https = require('https');
+const http  = require('http');
+const fs    = require('fs');
+const path  = require('path');
+
+// ══════════════════════════════════════════════════
+// إعدادات النظام
+// ══════════════════════════════════════════════════
+const CONFIG = {
+  // Firebase
+  FIREBASE_PROJECT : 'mohammedcarb-c7801',
+  FIREBASE_API_KEY : 'AIzaSyAohfz37g3S625HB3q8ChahPY3TZbT2_64',
+  FIRESTORE_COL    : 'appStorage',
+
+  // Green API — واتساب
+  // اشتراك مجاني من: https://green-api.com
+  WA_INSTANCE_ID    : process.env.WA_INSTANCE_ID    || '',  // مثال: 1101234567
+  WA_API_TOKEN      : process.env.WA_API_TOKEN      || '',  // مفتاح الـ API
+  WA_RECIPIENT      : process.env.WA_RECIPIENT      || '218926553884@c.us', // رقمك
+
+  // حدود التنبيه
+  HIGH_THRESHOLD    : parseInt(process.env.HIGH_THRESHOLD  || '250'),
+  HIGH_COUNT_LIMIT  : parseInt(process.env.HIGH_COUNT      || '3'),
+  LOW_THRESHOLD     : parseInt(process.env.LOW_THRESHOLD   || '70'),
+  LOW_COUNT_LIMIT   : parseInt(process.env.LOW_COUNT       || '2'),
+
+  // ساعة تنبيه "لم يسجّل" (بعد هذه الساعة مساءً)
+  NO_READING_ALERT_HOUR : parseInt(process.env.NO_READING_HOUR || '20'),
+
+  // ملف تتبع التنبيهات (منع التكرار)
+  ALERTS_FILE : path.join(__dirname, 'alerts_sent.json'),
+
+  // دقائق بين كل فحص
+  CHECK_INTERVAL_MIN : parseInt(process.env.CHECK_INTERVAL || '60'),
+};
+
+// ══════════════════════════════════════════════════
+// تحويل مفاتيح Firestore
+// ══════════════════════════════════════════════════
+function safeKey(key) {
+  return key.replace(/:/g, '__').replace(/\./g, '_dt_');
+}
+
+// ══════════════════════════════════════════════════
+// Firestore REST API
+// ══════════════════════════════════════════════════
+function firestoreGet(docId) {
+  return new Promise((resolve) => {
+    const url = `https://firestore.googleapis.com/v1/projects/${CONFIG.FIREBASE_PROJECT}/databases/(default)/documents/${CONFIG.FIRESTORE_COL}/${safeKey(docId)}?key=${CONFIG.FIREBASE_API_KEY}`;
+    https.get(url, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.error) { resolve(null); return; }
+          const val = json.fields?.value?.stringValue ?? null;
+          resolve(val ? JSON.parse(val) : null);
+        } catch { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
+
+// ══════════════════════════════════════════════════
+// إرسال واتساب عبر Green API
+// ══════════════════════════════════════════════════
+function sendWhatsApp(message) {
+  return new Promise((resolve) => {
+    if (!CONFIG.WA_INSTANCE_ID || !CONFIG.WA_API_TOKEN) {
+      console.warn('⚠️  لم يتم إعداد Green API — الرسالة ستُطبع فقط');
+      console.log('📱 رسالة:\n' + message);
+      resolve(false);
+      return;
+    }
+
+    const body = JSON.stringify({
+      chatId  : CONFIG.WA_RECIPIENT,
+      message : message,
+    });
+
+    const options = {
+      hostname : 'api.green-api.com',
+      path     : `/waInstance${CONFIG.WA_INSTANCE_ID}/sendMessage/${CONFIG.WA_API_TOKEN}`,
+      method   : 'POST',
+      headers  : {
+        'Content-Type'   : 'application/json',
+        'Content-Length' : Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        const ok = res.statusCode === 200;
+        console.log(ok
+          ? `✅ واتساب أُرسل بنجاح`
+          : `❌ فشل الإرسال (${res.statusCode}): ${data.slice(0,80)}`);
+        resolve(ok);
+      });
+    });
+    req.on('error', (e) => { console.error('❌ خطأ:', e.message); resolve(false); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// ══════════════════════════════════════════════════
+// إدارة التنبيهات المرسلة (منع التكرار)
+// ══════════════════════════════════════════════════
+function loadSentAlerts() {
+  try {
+    if (fs.existsSync(CONFIG.ALERTS_FILE))
+      return JSON.parse(fs.readFileSync(CONFIG.ALERTS_FILE, 'utf8'));
+  } catch {}
+  return {};
+}
+function saveSentAlerts(alerts) {
+  try { fs.writeFileSync(CONFIG.ALERTS_FILE, JSON.stringify(alerts, null, 2)); } catch {}
+}
+function wasAlertSent(a, phone, type, date) { return !!a[`${phone}:${type}:${date}`]; }
+function markAlertSent(a, phone, type, date) {
+  a[`${phone}:${type}:${date}`] = new Date().toISOString();
+  // تنظيف القديم (أكثر من 3 أيام)
+  const cut = Date.now() - 3 * 86400000;
+  Object.keys(a).forEach(k => { if (new Date(a[k]).getTime() < cut) delete a[k]; });
+}
+
+// ══════════════════════════════════════════════════
+// تحليل القراءات
+// ══════════════════════════════════════════════════
+function analyzeReadings(readings = {}) {
+  const vals = Object.entries(readings)
+    .filter(([,v]) => v && !isNaN(parseFloat(v)))
+    .map(([k,v]) => ({ k, v: parseFloat(v) }));
+  return {
+    total       : vals.length,
+    highCount   : vals.filter(r => r.v > CONFIG.HIGH_THRESHOLD).length,
+    lowCount    : vals.filter(r => r.v < CONFIG.LOW_THRESHOLD).length,
+    highReadings: vals.filter(r => r.v > CONFIG.HIGH_THRESHOLD).map(r => r.v),
+    lowReadings : vals.filter(r => r.v < CONFIG.LOW_THRESHOLD).map(r => r.v),
+  };
+}
+
+// مساعد: انتظار
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ══════════════════════════════════════════════════
+// الفحص الرئيسي
+// ══════════════════════════════════════════════════
+async function runCheck() {
+  const now   = new Date();
+  const today = now.toISOString().slice(0, 10);
+  const hour  = now.getHours();
+  const stamp = now.toLocaleTimeString('ar', { hour:'2-digit', minute:'2-digit' });
+
+  console.log(`\n${'═'.repeat(52)}`);
+  console.log(`🔍 فحص الساعة ${stamp} — ${today}`);
+  console.log('═'.repeat(52));
+
+  const sentAlerts = loadSentAlerts();
+
+  // جلب الحالات والبيانات
+  const [approved, patientData] = await Promise.all([
+    firestoreGet('access:approved'),
+    firestoreGet('patient_data_v1'),
+  ]);
+
+  if (!approved || !Object.keys(approved).length) {
+    console.log('ℹ️  لا توجد حالات معتمدة'); return;
+  }
+
+  const phones = Object.keys(approved);
+  const pd = patientData || {};
+  console.log(`👥 حالات: ${phones.length}`);
+
+  let alertsSent = 0;
+
+  for (const phone of phones) {
+    const name = pd[phone]?.name || approved[phone]?.name || phone;
+    const dayData = await firestoreGet(`ptsugar:${phone}:${today}`);
+    const stats = analyzeReadings(dayData?.readings);
+
+    console.log(`\n  👤 ${name} — قراءات: ${stats.total} | عالية: ${stats.highCount} | منخفضة: ${stats.lowCount}`);
+
+    // ─── 🚨 ارتفاع متكرر ───
+    if (stats.highCount >= CONFIG.HIGH_COUNT_LIMIT && !wasAlertSent(sentAlerts, phone, 'high', today)) {
+      const max = Math.max(...stats.highReadings);
+      await sendWhatsApp(
+        `🚨 *ارتفاع متكرر في السكر*\n` +
+        `━━━━━━━━━━━━━━\n` +
+        `👤 الحالة: ${name}\n` +
+        `📈 قراءات مرتفعة (>${CONFIG.HIGH_THRESHOLD}): *${stats.highCount} مرات*\n` +
+        `🔝 أعلى قراءة: *${max} mg/dL*\n` +
+        `📅 ${today} — الساعة ${stamp}\n` +
+        `━━━━━━━━━━━━━━\n` +
+        `⚕️ يُنصح بمراجعة الجرعة أو التواصل مع الحالة`
+      );
+      markAlertSent(sentAlerts, phone, 'high', today);
+      alertsSent++;
+      await sleep(3000);
+    }
+
+    // ─── ⬇️ هبوط متكرر ───
+    if (stats.lowCount >= CONFIG.LOW_COUNT_LIMIT && !wasAlertSent(sentAlerts, phone, 'low', today)) {
+      const min = Math.min(...stats.lowReadings);
+      await sendWhatsApp(
+        `⬇️ *هبوط متكرر في السكر*\n` +
+        `━━━━━━━━━━━━━━\n` +
+        `👤 الحالة: ${name}\n` +
+        `📉 قراءات منخفضة (<${CONFIG.LOW_THRESHOLD}): *${stats.lowCount} مرات*\n` +
+        `🔻 أدنى قراءة: *${min} mg/dL*\n` +
+        `📅 ${today} — الساعة ${stamp}\n` +
+        `━━━━━━━━━━━━━━\n` +
+        `🆘 تحقق من الحالة فوراً — خطر الهبوط الشديد`
+      );
+      markAlertSent(sentAlerts, phone, 'low', today);
+      alertsSent++;
+      await sleep(3000);
+    }
+
+    // ─── ⚠️ لم يسجّل طوال اليوم ───
+    if (stats.total === 0 && hour >= CONFIG.NO_READING_ALERT_HOUR && !wasAlertSent(sentAlerts, phone, 'none', today)) {
+      await sendWhatsApp(
+        `⚠️ *لم تُسجَّل قراءات السكر*\n` +
+        `━━━━━━━━━━━━━━\n` +
+        `👤 الحالة: ${name}\n` +
+        `📅 ${today}\n` +
+        `🕐 لا قراءات حتى الساعة ${stamp}\n` +
+        `━━━━━━━━━━━━━━\n` +
+        `📲 يُرجى التواصل مع الحالة ومتابعتها`
+      );
+      markAlertSent(sentAlerts, phone, 'none', today);
+      alertsSent++;
+      await sleep(3000);
+    }
+  }
+
+  saveSentAlerts(sentAlerts);
+  console.log(`\n✅ انتهى — تنبيهات مرسلة: ${alertsSent} | القادم بعد ${CONFIG.CHECK_INTERVAL_MIN} دقيقة\n`);
+}
+
+// ══════════════════════════════════════════════════
+// HTTP Ping — يُبقي الخادم حياً على Render
+// ══════════════════════════════════════════════════
+const PORT = process.env.PORT || 3000;
+http.createServer((_, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('🟢 وكيل المراقبة يعمل\n');
+}).listen(PORT, () => console.log(`🌐 HTTP على المنفذ ${PORT}`));
+
+// ══════════════════════════════════════════════════
+// التشغيل
+// ══════════════════════════════════════════════════
+console.log('🚀 وكيل مراقبة الحالات — كارب كالكيولاتور');
+console.log(`📱 رقم التنبيهات: ${CONFIG.WA_RECIPIENT}`);
+console.log(`⏱  كل ${CONFIG.CHECK_INTERVAL_MIN} دقيقة`);
+
+runCheck().catch(console.error);
+setInterval(() => runCheck().catch(console.error), CONFIG.CHECK_INTERVAL_MIN * 60 * 1000);
+
+
+// ══════════════════════════════════════════════════
+// وضع --once  (لـ GitHub Actions)
+// ══════════════════════════════════════════════════
+if (process.argv.includes('--once')) {
+  // تشغيل مرة واحدة فقط ثم إنهاء العملية
+  runCheck()
+    .then(() => { console.log('✅ اكتمل الفحص — خروج'); process.exit(0); })
+    .catch(e  => { console.error('❌ خطأ:', e.message); process.exit(1); });
+}
